@@ -4,8 +4,8 @@ Projeto 3 - Análise de Sentimentos em Comentários de Redes Sociais (PLN)
 Pipeline completo adaptado para execução local (Windows 11 / Linux / macOS).
 
 Etapas incluídas:
-  1. Configuração do ambiente e carregamento do corpus (NoThemeTweets.csv)
-  2. Pré-processamento e limpeza textual com spaCy + stopwords customizadas
+  1. Configuração do ambiente, cache e carregamento do corpus (NoThemeTweets.csv)
+  2. Pré-processamento e limpeza textual com spaCy + prevenção real de Target Leakage
   3. Análise Exploratória (EDA) com gráficos individuais em alta resolução
   4. Modelagem modular: BoW, TF-IDF (word e char), Reg. Logística, LinearSVC,
      MultinomialNB, ComplementNB, Tuning (GridSearchCV) e Baseline Léxico (LeIA)
@@ -14,6 +14,8 @@ Etapas incluídas:
   6. Experimento de hipótese: impacto dos emoticons (Target Leakage vs. Generalização)
 """
 
+import hashlib
+import html
 import os
 import pickle
 import re
@@ -24,20 +26,27 @@ import unicodedata
 # ==============================================================================
 # CONFIGURAÇÕES GERAIS (edite aqui conforme sua necessidade)
 # ==============================================================================
-LIMITE_AMOSTRA = 10000          # Use None para processar o dataset completo
-USAR_LEMA = True                # True = lematização com spaCy; False = apenas tokens limpos
+LIMITE_AMOSTRA = 10000               # Use None para processar o dataset completo
+USAR_LEMA = True                    # True = lematização com spaCy; False = apenas tokens limpos
+REMOVER_EMOTICONS_PRINCIPAL = True  # True = evita Target Leakage da supervisão distante (:), :(
+NORMALIZAR_ALONGAMENTOS = True      # True = reduz repetições extremas (ex.: kkkkkk -> kk, muuuuito -> muuito)
 TEST_SIZE = 0.2
 RANDOM_STATE = 42
-CV_FOLDS = 5                    # Se ficar lento com dataset completo, reduza para 3
+CV_FOLDS = 5                        # Se ficar lento com dataset completo, reduza para 3
 
-# Paralelismo (otimizado para Windows 11 + CPU AMD multi-core)
-N_PROCESS_SPACY = 2             # Para 10k tweets no Windows, 1 evita custo de spawn; para dataset inteiro, use 2 a 4
-N_JOBS_SKLEARN = -1             # -1 usa todos os threads lógicos da sua CPU AMD no GridSearchCV
+# Paralelismo (otimizado para Windows 11 + CPU multi-core sem estourar RAM)
+N_PROCESS_SPACY = 2                 # Usado automaticamente apenas para lotes >= 20k textos
+N_JOBS_SKLEARN = max(1, min(4, (os.cpu_count() or 2) - 1))  # Evita OOM no Windows com dataset completo
+GRIDSEARCH_VERBOSE = 1              # Exibe progresso no terminal durante o GridSearchCV
+
+# Cache de pré-processamento (evita reprocessar ~785k tweets no spaCy a cada execução)
+USAR_CACHE_PREPROCESSAMENTO = True
+PASTA_CACHE = "cache_dados"
 
 # Saídas e visualização
 PASTA_MODELOS = "modelos_pkl"
 PASTA_GRAFICOS = "graficos"
-EXIBIR_GRAFICOS = False         # False = apenas salva os PNGs (não trava o terminal); True = abre janela por gráfico
+EXIBIR_GRAFICOS = False             # False = apenas salva os PNGs (não trava o terminal); True = abre janela por gráfico
 DPI_GRAFICOS = 300
 
 # Experimento extra (Seção 6): Com vs. Sem emoticons
@@ -85,7 +94,7 @@ SPACY_MODELS = {
 EMOTICONS = []
 EMOTICONS_SET = {emo.lower() for emo in EMOTICONS}
 
-# Usado no baseline LeIA e no experimento de hipótese (Seção 6)
+# Usado no experimento de hipótese (Seção 6)
 LISTA_EMOTICONS_HIPOTESE = [
     ":)", ":(", ";)", ";(", "xD", "xd", ":D", ":d",
     ":/", "<3", ":-)", ":-(", "=)", "=(", ":p", ":P", ":'("
@@ -97,9 +106,23 @@ PALAVRAS_RELEVANTES_SENTIMENTO = {
     "mais", "muito", "pouco", "bem", "mal", "bom", "ruim",
 }
 
-RE_URLS = re.compile(r"https?://\S+|www\.\S+")
+RE_URLS = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 RE_MENCOES = re.compile(r"@\w+")
-RE_EMOTICONS_LEAKAGE = re.compile(r"[:;=8][\-o\*\']?[\)\]\(\[dDpP/\:\}\{@\|\\]")
+RE_RT = re.compile(r"\brt\b", re.IGNORECASE)
+RE_ALONGAMENTOS = re.compile(r"(.)\1{2,}")
+RE_ESPACOS = re.compile(r"\s+")
+
+# Regex segura contra falsos positivos em horários (18:30), frações (8/10) e palavras (8pm),
+# cobrindo emoticons ASCII com repetições (:(((, :))), xD, <3, ;-;, T_T e invertidos ((:, ):)
+RE_EMOTICONS_LEAKAGE = re.compile(
+    r"(?:[:;=][\-o\*\']?[\)\]\(\[\}\{@\|\\]+)"
+    r"|(?:(?<!\w)[:;=8][\-o\*\']?[dDpP/]+(?!\w))"
+    r"|(?:(?<!\w)8[\-o\*\']?[\)\]\(\[\}\{@\|\\]+(?!\w))"
+    r"|(?:(?<!\w)[\(\)\[\]]+[\-o\*\']?[:;=](?!\w))"
+    r"|(?:(?<!\w)<3+(?!\w))"
+    r"|(?:(?<!\w)[xX][dD]+(?!\w))"
+    r"|(?:(?<!\w)(?:[;:\^][_\-\.][;:\^]|[tT]_[tT])(?!\w))"
+)
 
 VETORIZADORES = {
     "tfidf": TfidfVectorizer,
@@ -125,10 +148,21 @@ def configurar_console_utf8():
         pass
 
 
-def carregar_spacy(modelo: str = SPACY_MODELS["SMALL"], emoticons_especiais: list[str] = None):
-    """Carrega o modelo spaCy desativando parser e NER para máxima velocidade."""
+def carregar_spacy(
+    modelo: str = SPACY_MODELS["SMALL"],
+    emoticons_especiais: list[str] = None,
+    usar_lema: bool = True,
+):
+    """
+    Carrega o modelo spaCy desativando componentes não utilizados.
+    Quando `usar_lema=False`, desabilita também o pipeline morfológico para máxima velocidade.
+    """
+    desabilitar = ["parser", "ner"]
+    if not usar_lema:
+        desabilitar.extend(["tok2vec", "morphologizer", "attribute_ruler", "lemmatizer"])
+
     try:
-        nlp_model = spacy.load(modelo, disable=["parser", "ner"])
+        nlp_model = spacy.load(modelo, disable=desabilitar)
     except OSError as exc:
         raise RuntimeError(
             f"Modelo spaCy '{modelo}' não encontrado. "
@@ -158,12 +192,38 @@ def carregar_corpus() -> pd.DataFrame:
 # ==============================================================================
 # 2. PRÉ-PROCESSAMENTO E LIMPEZA TEXTUAL
 # ==============================================================================
-def pre_limpar_string(texto: str) -> str:
-    """Normaliza Unicode (NFKC), remove URLs, menções (@) e converte para minúsculas."""
+def pre_limpar_string(
+    texto: str,
+    remover_emoticons: bool = REMOVER_EMOTICONS_PRINCIPAL,
+    normalizar_alongamentos: bool = NORMALIZAR_ALONGAMENTOS,
+) -> str:
+    """
+    Decodifica entidades HTML, normaliza Unicode (NFKC), remove URLs, menções (@),
+    marcadores de RT, (opcionalmente) emoticons ASCII de supervisão distante
+    e normaliza alongamentos excessivos.
+    """
+    texto = html.unescape(texto)
     texto = unicodedata.normalize("NFKC", texto)
-    texto = RE_URLS.sub("", texto)
-    texto = RE_MENCOES.sub("", texto)
-    return texto.lower().strip()
+    texto = RE_URLS.sub(" ", texto)
+    texto = RE_MENCOES.sub(" ", texto)
+    texto = RE_RT.sub(" ", texto)
+    if remover_emoticons:
+        texto = RE_EMOTICONS_LEAKAGE.sub(" ", texto)
+    texto = texto.lower()
+    if normalizar_alongamentos:
+        texto = RE_ALONGAMENTOS.sub(r"\1\1", texto)
+    return RE_ESPACOS.sub(" ", texto).strip()
+
+
+def limpar_texto_para_leia(texto: str, remover_emoticons: bool = True) -> str:
+    """Limpeza leve específica para o léxico LeIA (preserva pontuação e caixa alta)."""
+    s = html.unescape(str(texto))
+    s = RE_URLS.sub(" ", s)
+    s = RE_MENCOES.sub(" ", s)
+    s = RE_RT.sub(" ", s)
+    if remover_emoticons:
+        s = RE_EMOTICONS_LEAKAGE.sub(" ", s)
+    return RE_ESPACOS.sub(" ", s).strip()
 
 
 def is_emoji(texto: str) -> bool:
@@ -197,6 +257,10 @@ def processar_tokens(
         palavra = token.lemma_.lower().strip() if usar_lema else termo
         palavra = palavra.lstrip("#")
 
+        # Descarta tokens sem nenhuma letra (ex.: horários '18:30', frações '8/10', símbolos residuais)
+        if not any(c.isalpha() for c in palavra):
+            continue
+
         if palavra and palavra not in stopwords_set and len(palavra) > 1:
             tokens_processados.append(palavra)
 
@@ -209,12 +273,41 @@ def limpar_texto(
     nlp_model,
     usar_lema: bool = True,
     emoticons_set: set[str] = None,
+    remover_emoticons: bool = REMOVER_EMOTICONS_PRINCIPAL,
+    normalizar_alongamentos: bool = NORMALIZAR_ALONGAMENTOS,
 ) -> str:
     """Limpa um texto individual (usado em runtime e na inferência de frases inéditas)."""
     if not isinstance(texto, str):
         return ""
-    doc = nlp_model(pre_limpar_string(texto))
-    return " ".join(processar_tokens(doc, stopwords_set, usar_lema=usar_lema, emoticons_set=emoticons_set))
+    pre_limpo = pre_limpar_string(
+        texto,
+        remover_emoticons=remover_emoticons,
+        normalizar_alongamentos=normalizar_alongamentos,
+    )
+    doc = nlp_model(pre_limpo)
+    return " ".join(
+        processar_tokens(doc, stopwords_set, usar_lema=usar_lema, emoticons_set=emoticons_set)
+    )
+
+
+def _obter_caminho_cache(
+    limite: int,
+    usar_lema: bool,
+    remover_emoticons: bool,
+    normalizar_alongamentos: bool,
+    random_state: int,
+    stopwords_set: set[str],
+    pasta_cache: str = PASTA_CACHE,
+) -> str:
+    """Gera nome de cache determinístico baseado nas configurações de pré-processamento."""
+    assinatura = (
+        f"lim={limite}|lema={usar_lema}|rem_emo={remover_emoticons}|"
+        f"along={normalizar_alongamentos}|rs={random_state}|"
+        f"sw={sorted(stopwords_set)}"
+    )
+    chave = hashlib.md5(assinatura.encode("utf-8")).hexdigest()[:10]
+    os.makedirs(pasta_cache, exist_ok=True)
+    return os.path.join(pasta_cache, f"corpus_limpo_{limite or 'full'}_{chave}.pkl")
 
 
 def limpar_dataset(
@@ -225,14 +318,34 @@ def limpar_dataset(
     coluna_alvo: str = "sentiment",
     limite: int = None,
     usar_lema: bool = True,
+    remover_emoticons: bool = REMOVER_EMOTICONS_PRINCIPAL,
+    normalizar_alongamentos: bool = NORMALIZAR_ALONGAMENTOS,
+    emoticons_set: set[str] = None,
     batch_size: int = 1000,
     n_process: int = 1,
     random_state: int = 42,
+    usar_cache: bool = USAR_CACHE_PREPROCESSAMENTO,
 ) -> pd.DataFrame:
     """
-    Limpa o corpus em lote usando nlp.pipe.
+    Limpa o corpus em lote usando nlp.pipe (com suporte a cache em disco).
     Quando `limite` é definido, aplica amostragem estratificada por `coluna_alvo`.
     """
+    stopwords_norm = {s.lower() for s in stopwords_set}
+    caminho_cache = None
+
+    if usar_cache:
+        caminho_cache = _obter_caminho_cache(
+            limite=limite,
+            usar_lema=usar_lema,
+            remover_emoticons=remover_emoticons,
+            normalizar_alongamentos=normalizar_alongamentos,
+            random_state=random_state,
+            stopwords_set=stopwords_norm,
+        )
+        if os.path.exists(caminho_cache):
+            print(f"[Cache encontrado] Carregando corpus pré-processado de: {caminho_cache}")
+            return pd.read_pickle(caminho_cache)
+
     colunas_validacao = [c for c in [coluna_texto, coluna_alvo] if c in dataframe.columns]
     df_base = dataframe.dropna(subset=colunas_validacao).drop_duplicates(subset=[coluna_texto], keep="first")
 
@@ -250,12 +363,23 @@ def limpar_dataset(
     else:
         df_copia = df_base.copy()
 
-    textos_pre_limpos = [pre_limpar_string(str(t)) for t in df_copia[coluna_texto]]
-    stopwords_norm = {s.lower() for s in stopwords_set}
+    textos_pre_limpos = [
+        pre_limpar_string(
+            str(t),
+            remover_emoticons=remover_emoticons,
+            normalizar_alongamentos=normalizar_alongamentos,
+        )
+        for t in df_copia[coluna_texto]
+    ]
+
+    # Evita overhead de spawn no Windows para lotes pequenos
+    n_proc_efetivo = 1 if len(textos_pre_limpos) < 20000 else max(1, n_process)
 
     tokens_limpos_lote = [
-        " ".join(processar_tokens(doc, stopwords_norm, usar_lema=usar_lema))
-        for doc in nlp_model.pipe(textos_pre_limpos, batch_size=batch_size, n_process=n_process)
+        " ".join(
+            processar_tokens(doc, stopwords_norm, usar_lema=usar_lema, emoticons_set=emoticons_set)
+        )
+        for doc in nlp_model.pipe(textos_pre_limpos, batch_size=batch_size, n_process=n_proc_efetivo)
     ]
 
     coluna_limpa = f"{coluna_texto}_limpo"
@@ -268,9 +392,14 @@ def limpar_dataset(
     total_depois = len(df_copia)
     removidos = total_antes - total_depois
 
-    print(f"Registros antes da deduplicação pós-limpeza: {total_antes}")
-    print(f"Registros duplicados removidos: {removidos} ({removidos / max(total_antes, 1) * 100:.2f}%)")
-    print(f"Registros únicos mantidos: {total_depois}")
+    print(f"Registros antes da deduplicação pós-limpeza: {total_antes:,}".replace(",", "."))
+    print(f"Registros duplicados removidos: {removidos:,} ({removidos / max(total_antes, 1) * 100:.2f}%)".replace(",", "."))
+    print(f"Registros únicos mantidos: {total_depois:,}".replace(",", "."))
+
+    if usar_cache and caminho_cache:
+        df_copia.to_pickle(caminho_cache)
+        print(f"[Cache salvo] {caminho_cache}")
+
     return df_copia
 
 
@@ -322,8 +451,9 @@ def plotar_analise_exploratoria(
     pasta_saida: str = PASTA_GRAFICOS,
 ):
     """Imprime estatísticas da EDA e gera gráficos individuais bem espaçados."""
-    contagem = dataset_limpo["sentiment"].value_counts()
-    percentual = dataset_limpo["sentiment"].value_counts(normalize=True) * 100
+    df_eda = dataset_limpo.copy()
+    contagem = df_eda["sentiment"].value_counts()
+    percentual = df_eda["sentiment"].value_counts(normalize=True) * 100
 
     resumo_classes = pd.DataFrame({
         "Quantidade": contagem,
@@ -332,22 +462,23 @@ def plotar_analise_exploratoria(
     print("\n=== Distribuição de Classes ===")
     print(resumo_classes)
 
-    dataset_limpo["qtd_caracteres"] = dataset_limpo["tweet_text_limpo"].astype(str).str.len()
-    dataset_limpo["qtd_palavras"] = dataset_limpo["tweet_text_limpo"].astype(str).str.split().str.len()
+    df_eda["qtd_caracteres"] = df_eda["tweet_text_limpo"].astype(str).str.len()
+    df_eda["qtd_palavras"] = df_eda["tweet_text_limpo"].astype(str).str.split().str.len()
 
     print("\n=== Estatísticas Gerais de Tamanho ===")
-    print(dataset_limpo[["qtd_caracteres", "qtd_palavras"]].describe().round(2))
+    print(df_eda[["qtd_caracteres", "qtd_palavras"]].describe().round(2))
     print("\n=== Tamanho Médio (Palavras) por Classe ===")
-    print(dataset_limpo.groupby("sentiment")["qtd_palavras"].describe().round(2))
+    print(df_eda.groupby("sentiment")["qtd_palavras"].describe().round(2))
 
     # --- Imagem 1: Distribuição de Classes ---
-    cores_classes = ["#4C72B0", "#DD8452", "#55A868"]
+    paleta_base = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B3"]
+    cores_classes = [paleta_base[i % len(paleta_base)] for i in range(len(contagem))]
     fig, ax = plt.subplots(figsize=(7.5, 4.8))
     barras = ax.bar(
         contagem.index.astype(str),
         contagem.values,
         width=0.52,
-        color=cores_classes[:len(contagem)],
+        color=cores_classes,
         edgecolor="#222222",
         linewidth=0.8,
     )
@@ -369,18 +500,20 @@ def plotar_analise_exploratoria(
         )
     _exibir_e_salvar(fig, "01_eda_distribuicao_classes.png", pasta_saida)
 
-    # --- Imagem 2: Distribuição do Tamanho das Mensagens ---
-    qtd_palavras = dataset_limpo["qtd_palavras"]
+    # --- Imagem 2: Distribuição do Tamanho das Mensagens (recorte no P99 para evitar distorção por outliers) ---
+    qtd_palavras = df_eda["qtd_palavras"]
     media = qtd_palavras.mean()
     mediana = qtd_palavras.median()
+    limite_p99 = max(int(np.percentile(qtd_palavras, 99)), 5)
+    dados_vis = qtd_palavras[qtd_palavras <= limite_p99]
 
     fig, ax = plt.subplots(figsize=(8.5, 4.8))
-    n_bins = min(int(qtd_palavras.max()), 25)
-    ax.hist(qtd_palavras, bins=max(n_bins, 5), color="#2A9D8F", edgecolor="white", alpha=0.9)
+    bins = np.arange(1, limite_p99 + 2) - 0.5
+    ax.hist(dados_vis, bins=bins, color="#2A9D8F", edgecolor="white", alpha=0.9)
     ax.axvline(media, color="#E76F51", linestyle="--", linewidth=2, label=f"Média: {media:.1f} palavras")
     ax.axvline(mediana, color="#264653", linestyle=":", linewidth=2, label=f"Mediana: {mediana:.0f} palavras")
 
-    ax.set_title("Distribuição do Tamanho dos Tweets Após Limpeza", fontsize=13, fontweight="bold", pad=14)
+    ax.set_title(f"Distribuição do Tamanho dos Tweets Após Limpeza (até P99 = {limite_p99} palavras)", fontsize=12.5, fontweight="bold", pad=14)
     ax.set_xlabel("Número de Palavras por Tweet", fontsize=11)
     ax.set_ylabel("Frequência (Nº de Tweets)", fontsize=11)
     ax.legend(frameon=True, facecolor="white", edgecolor="#CCCCCC", fontsize=10)
@@ -388,11 +521,12 @@ def plotar_analise_exploratoria(
     _exibir_e_salvar(fig, "02_eda_tamanho_mensagens.png", pasta_saida)
 
     # --- Imagens 3+: Top N Termos — uma imagem separada por classe ---
-    classes_eda = sorted(dataset_limpo["sentiment"].unique())
-    paleta_termos = ["#C44E52", "#4C72B0", "#55A868"]
+    classes_eda = sorted(df_eda["sentiment"].unique())
+    paleta_termos = ["#C44E52", "#4C72B0", "#55A868", "#DD8452", "#8172B3"]
 
-    for idx, (classe, cor) in enumerate(zip(classes_eda, paleta_termos), start=1):
-        textos_classe = dataset_limpo[dataset_limpo["sentiment"] == classe]["tweet_text_limpo"]
+    for idx, classe in enumerate(classes_eda, start=1):
+        cor = paleta_termos[(idx - 1) % len(paleta_termos)]
+        textos_classe = df_eda[df_eda["sentiment"] == classe]["tweet_text_limpo"]
         df_top = obter_top_termos(textos_classe, n_termos)
 
         fig, ax = plt.subplots(figsize=(8.5, max(5.0, n_termos * 0.48)))
@@ -471,7 +605,11 @@ def construir_pipeline(
     if nome_classificador not in CLASSIFICADORES:
         raise ValueError(f"Classificador inválido: '{nome_classificador}'. Opções: {list(CLASSIFICADORES)}")
 
-    vec = VETORIZADORES[nome_vetorizador](**(params_vec or {}))
+    vec_kwargs = dict(params_vec or {})
+    if nome_vetorizador == "tfidf" and "dtype" not in vec_kwargs:
+        vec_kwargs["dtype"] = np.float32  # Reduz uso de RAM pela metade sem perda prática
+
+    vec = VETORIZADORES[nome_vetorizador](**vec_kwargs)
     clf = CLASSIFICADORES[nome_classificador](**(params_clf or {}))
     return Pipeline([("vec", vec), ("clf", clf)])
 
@@ -482,6 +620,8 @@ def medir_latencia_runtime_ml(
     stopwords_set: set[str],
     nlp_model,
     usar_lema: bool = True,
+    remover_emoticons: bool = REMOVER_EMOTICONS_PRINCIPAL,
+    normalizar_alongamentos: bool = NORMALIZAR_ALONGAMENTOS,
 ) -> dict:
     """
     Mede latência unitária (1 tweet por vez):
@@ -491,7 +631,17 @@ def medir_latencia_runtime_ml(
     if not textos_brutos_amostra:
         return {"runtime_modelo_ms": 0.0, "runtime_e2e_ms": 0.0}
 
-    textos_limpos = [limpar_texto(t, stopwords_set, nlp_model, usar_lema=usar_lema) for t in textos_brutos_amostra]
+    textos_limpos = [
+        limpar_texto(
+            t,
+            stopwords_set,
+            nlp_model,
+            usar_lema=usar_lema,
+            remover_emoticons=remover_emoticons,
+            normalizar_alongamentos=normalizar_alongamentos,
+        )
+        for t in textos_brutos_amostra
+    ]
 
     t0 = time.perf_counter()
     for txt in textos_limpos:
@@ -500,7 +650,14 @@ def medir_latencia_runtime_ml(
 
     t0 = time.perf_counter()
     for txt in textos_brutos_amostra:
-        limpo = limpar_texto(txt, stopwords_set, nlp_model, usar_lema=usar_lema)
+        limpo = limpar_texto(
+            txt,
+            stopwords_set,
+            nlp_model,
+            usar_lema=usar_lema,
+            remover_emoticons=remover_emoticons,
+            normalizar_alongamentos=normalizar_alongamentos,
+        )
         pipeline.predict([limpo])
     ms_ponta_a_ponta = ((time.perf_counter() - t0) / len(textos_brutos_amostra)) * 1000
 
@@ -525,6 +682,8 @@ def executar_suite_benchmarks(
     stopwords_set: set[str],
     nlp_model,
     usar_lema: bool = USAR_LEMA,
+    remover_emoticons: bool = REMOVER_EMOTICONS_PRINCIPAL,
+    normalizar_alongamentos: bool = NORMALIZAR_ALONGAMENTOS,
     pasta_modelos: str = PASTA_MODELOS,
     n_amostras_runtime: int = 100,
     incluir_leia: bool = True,
@@ -571,6 +730,8 @@ def executar_suite_benchmarks(
                 scoring="f1_macro",
                 cv=cv,
                 n_jobs=n_jobs,
+                pre_dispatch="2*n_jobs",
+                verbose=GRIDSEARCH_VERBOSE,
                 refit=True,
             )
             busca.fit(X_treino, y_treino)
@@ -599,9 +760,17 @@ def executar_suite_benchmarks(
         report = classification_report(y_teste, y_pred, zero_division=0)
 
         # 4. Latência em runtime (1 tweet por vez)
-        latencias = medir_latencia_runtime_ml(melhor_pipeline, amostra_runtime, stopwords_set, nlp_model, usar_lema=usar_lema)
+        latencias = medir_latencia_runtime_ml(
+            melhor_pipeline,
+            amostra_runtime,
+            stopwords_set,
+            nlp_model,
+            usar_lema=usar_lema,
+            remover_emoticons=remover_emoticons,
+            normalizar_alongamentos=normalizar_alongamentos,
+        )
 
-        # 5. Serialização em .pkl
+        # 5. Serialização em .pkl com metadados completos de pré-processamento
         slug = re.sub(r"[^a-zA-Z0-9_]+", "_", nome.lower()).strip("_")
         caminho_pkl = os.path.join(pasta_modelos, f"{slug}.pkl")
         artefato = {
@@ -611,6 +780,8 @@ def executar_suite_benchmarks(
             "hiperparametros": melhores_params,
             "stopwords": stopwords_set,
             "usar_lema": usar_lema,
+            "remover_emoticons": remover_emoticons,
+            "normalizar_alongamentos": normalizar_alongamentos,
             "metricas_teste": {
                 "acuracia": acc,
                 "precision_macro": prec_m,
@@ -658,23 +829,25 @@ def executar_suite_benchmarks(
     if incluir_leia:
         print("\n>>> Executando baseline léxico: LeIA")
         sia = SentimentIntensityAnalyzer()
-        textos_leia = df_teste["tweet_text"].astype(str)
-        if remover_emoticons_leia:
-            textos_leia = textos_leia.apply(lambda t: RE_EMOTICONS_LEAKAGE.sub("", t))
+        textos_leia = [
+            limpar_texto_para_leia(t, remover_emoticons=remover_emoticons_leia)
+            for t in df_teste["tweet_text"].astype(str)
+        ]
 
         rotulo_pos = "Positivo" if "Positivo" in classes else classes[-1]
         rotulo_neg = "Negativo" if "Negativo" in classes else classes[0]
 
         t0_teste = time.perf_counter()
-        y_pred_leia = [
-            rotulo_pos if sia.polarity_scores(t)["compound"] >= 0.0 else rotulo_neg
-            for t in textos_leia
-        ]
+        scores_leia = [sia.polarity_scores(t)["compound"] for t in textos_leia]
+        y_pred_leia = [rotulo_pos if s >= 0.0 else rotulo_neg for s in scores_leia]
         tempo_teste_s = time.perf_counter() - t0_teste
+
+        qtd_neutros = sum(1 for s in scores_leia if s == 0.0)
+        pct_neutros = (qtd_neutros / max(len(scores_leia), 1)) * 100
 
         t0_rt = time.perf_counter()
         for t in amostra_runtime:
-            txt = RE_EMOTICONS_LEAKAGE.sub("", t) if remover_emoticons_leia else t
+            txt = limpar_texto_para_leia(t, remover_emoticons=remover_emoticons_leia)
             _ = rotulo_pos if sia.polarity_scores(txt)["compound"] >= 0.0 else rotulo_neg
         runtime_leia_ms = ((time.perf_counter() - t0_rt) / max(len(amostra_runtime), 1)) * 1000
 
@@ -709,10 +882,16 @@ def executar_suite_benchmarks(
             "y_pred": np.array(y_pred_leia),
             "confusion_matrix": cm,
             "classification_report": classification_report(y_teste, y_pred_leia, zero_division=0),
-            "melhores_params": {"remover_emoticons": remover_emoticons_leia},
+            "melhores_params": {
+                "remover_emoticons": remover_emoticons_leia,
+                "tweets_neutros_compound_zero_pct": round(pct_neutros, 2),
+            },
             "caminho_pkl": None,
         }
-        print(f"   F1-Macro: {f1_m:.4f} | Acurácia: {acc:.4f} | Runtime: {runtime_leia_ms:.2f}ms")
+        print(
+            f"   F1-Macro: {f1_m:.4f} | Acurácia: {acc:.4f} | Runtime: {runtime_leia_ms:.2f}ms | "
+            f"Neutros (compound=0.0): {pct_neutros:.1f}%"
+        )
 
     df_resultados = pd.DataFrame(resultados).sort_values(by="F1_Macro", ascending=False).reset_index(drop=True)
     return df_resultados, detalhes_modelos, classes
@@ -796,7 +975,7 @@ def plotar_relatorio_benchmarks(
 
     # --- Imagem 3: Trade-off F1-Macro vs. Tempo de Treino ---
     fig, ax = plt.subplots(figsize=(11.5, 6.0))
-    paleta_pts = plt.cm.tab10(np.linspace(0, 1, max(n_modelos, 10)))
+    paleta_pts = plt.get_cmap("tab10").colors if n_modelos <= 10 else plt.get_cmap("tab20").colors
 
     tempos_pos = df["Tempo_Treino_s"][df["Tempo_Treino_s"] > 0]
     usar_symlog = len(tempos_pos) > 0 and (tempos_pos.max() / max(tempos_pos.median(), 1e-3) > 8)
@@ -939,13 +1118,26 @@ def plotar_relatorio_benchmarks(
         _exibir_e_salvar(fig, f"09_{rank}_matriz_confusao_{slug}.png", pasta_saida)
 
 
-def inspecionar_erros(df_teste: pd.DataFrame, detalhes: dict, nome_experimento: str, n: int = 10) -> pd.DataFrame:
-    """Extrai exemplos reais classificados incorretamente para análise qualitativa."""
+def inspecionar_erros(
+    df_teste: pd.DataFrame,
+    detalhes: dict,
+    nome_experimento: str,
+    n: int = 10,
+    pasta_saida: str = PASTA_GRAFICOS,
+) -> pd.DataFrame:
+    """Extrai exemplos reais classificados incorretamente e salva amostra para análise qualitativa."""
     y_pred = detalhes[nome_experimento]["y_pred"]
     df_analise = df_teste[["tweet_text", "tweet_text_limpo", "sentiment"]].copy()
     df_analise["predito"] = y_pred
     erros = df_analise[df_analise["sentiment"] != df_analise["predito"]]
-    print(f"Total de erros ({nome_experimento}): {len(erros)} de {len(df_analise)} ({len(erros) / len(df_analise) * 100:.2f}%)")
+    print(f"Total de erros ({nome_experimento}): {len(erros):,} de {len(df_analise):,} ({len(erros) / len(df_analise) * 100:.2f}%)".replace(",", "."))
+
+    if pasta_saida:
+        os.makedirs(pasta_saida, exist_ok=True)
+        caminho_erros = os.path.join(pasta_saida, "erros_melhor_modelo.csv")
+        erros.head(200).to_csv(caminho_erros, index=False, encoding="utf-8-sig")
+        print(f"   [Erros salvos] {caminho_erros}")
+
     return erros.head(n)
 
 
@@ -955,14 +1147,25 @@ def carregar_modelo_e_prever(caminho_pkl: str, texto_usuario: str, nlp_model) ->
         artefato = pickle.load(f)
 
     t0 = time.perf_counter()
-    texto_limpo = limpar_texto(texto_usuario, artefato["stopwords"], nlp_model, usar_lema=artefato["usar_lema"])
+    texto_limpo = limpar_texto(
+        texto_usuario,
+        artefato["stopwords"],
+        nlp_model,
+        usar_lema=artefato.get("usar_lema", True),
+        remover_emoticons=artefato.get("remover_emoticons", True),
+        normalizar_alongamentos=artefato.get("normalizar_alongamentos", True),
+    )
     pipeline = artefato["pipeline"]
     predicao = pipeline.predict([texto_limpo])[0]
 
-    confianca = None
     if hasattr(pipeline, "predict_proba"):
         probs = pipeline.predict_proba([texto_limpo])[0]
-        confianca = float(np.max(probs))
+        confianca = round(float(np.max(probs)), 4)
+    elif hasattr(pipeline, "decision_function"):
+        margem = pipeline.decision_function([texto_limpo])
+        confianca = f"margem={float(np.max(np.abs(margem))):.4f}"
+    else:
+        confianca = "N/A"
 
     latencia_ms = (time.perf_counter() - t0) * 1000
     return {
@@ -970,7 +1173,7 @@ def carregar_modelo_e_prever(caminho_pkl: str, texto_usuario: str, nlp_model) ->
         "texto_original": texto_usuario,
         "texto_limpo": texto_limpo,
         "sentimento_previsto": predicao,
-        "confianca": round(confianca, 4) if confianca is not None else "N/A (sem predict_proba)",
+        "confianca": confianca,
         "latencia_ms": round(latencia_ms, 2),
     }
 
@@ -993,28 +1196,41 @@ def executar_experimento_hipotese_emoticons(
     print("=" * 70)
 
     emo_set = {e.lower() for e in LISTA_EMOTICONS_HIPOTESE}
-    nlp_com_emo = carregar_spacy(SPACY_MODELS["SMALL"], emoticons_especiais=LISTA_EMOTICONS_HIPOTESE)
+    nlp_com_emo = carregar_spacy(
+        SPACY_MODELS["SMALL"],
+        emoticons_especiais=LISTA_EMOTICONS_HIPOTESE,
+        usar_lema=usar_lema,
+    )
 
     def _limpar_lote(textos, manter_emoticons: bool):
         modelo_nlp = nlp_com_emo if manter_emoticons else nlp_sem_emo
         emo_atual = emo_set if manter_emoticons else set()
-        textos_pre = []
-        for t in textos:
-            s = pre_limpar_string(str(t))
-            if not manter_emoticons:
-                s = RE_EMOTICONS_LEAKAGE.sub("", s)
-            textos_pre.append(s)
+        textos_pre = [
+            pre_limpar_string(
+                str(t),
+                remover_emoticons=not manter_emoticons,
+                normalizar_alongamentos=NORMALIZAR_ALONGAMENTOS,
+            )
+            for t in textos
+        ]
+        n_proc_efetivo = 1 if len(textos_pre) < 20000 else max(1, n_process)
 
         return [
             " ".join(processar_tokens(doc, stopwords_set, usar_lema=usar_lema, emoticons_set=emo_atual))
-            for doc in modelo_nlp.pipe(textos_pre, batch_size=1000, n_process=n_process)
+            for doc in modelo_nlp.pipe(textos_pre, batch_size=1000, n_process=n_proc_efetivo)
         ]
 
     print("Preparando versões COM e SEM emoticons sobre o mesmo split...")
     X_tr_com = _limpar_lote(df_treino["tweet_text"], manter_emoticons=True)
     X_te_com = _limpar_lote(df_teste["tweet_text"], manter_emoticons=True)
-    X_tr_sem = _limpar_lote(df_treino["tweet_text"], manter_emoticons=False)
-    X_te_sem = _limpar_lote(df_teste["tweet_text"], manter_emoticons=False)
+
+    # Reutiliza a versão SEM emoticons já calculada no pipeline principal quando aplicável
+    if REMOVER_EMOTICONS_PRINCIPAL and "tweet_text_limpo" in df_treino.columns:
+        X_tr_sem = df_treino["tweet_text_limpo"].astype(str).tolist()
+        X_te_sem = df_teste["tweet_text_limpo"].astype(str).tolist()
+    else:
+        X_tr_sem = _limpar_lote(df_treino["tweet_text"], manter_emoticons=False)
+        X_te_sem = _limpar_lote(df_teste["tweet_text"], manter_emoticons=False)
 
     y_tr = df_treino["sentiment"]
     y_te = df_teste["sentiment"]
@@ -1030,12 +1246,12 @@ def executar_experimento_hipotese_emoticons(
 
     for nome_clf, fabrica_clf in modelos_teste.items():
         pipe_com = Pipeline([
-            ("vec", TfidfVectorizer(token_pattern=r"\S+", ngram_range=(1, 2), min_df=2, max_features=20000)),
+            ("vec", TfidfVectorizer(token_pattern=r"\S+", ngram_range=(1, 2), min_df=2, max_features=20000, dtype=np.float32)),
             ("clf", fabrica_clf()),
         ]).fit(X_tr_com, y_tr)
 
         pipe_sem = Pipeline([
-            ("vec", TfidfVectorizer(token_pattern=r"\S+", ngram_range=(1, 2), min_df=2, max_features=20000)),
+            ("vec", TfidfVectorizer(token_pattern=r"\S+", ngram_range=(1, 2), min_df=2, max_features=20000, dtype=np.float32)),
             ("clf", fabrica_clf()),
         ]).fit(X_tr_sem, y_tr)
 
@@ -1062,8 +1278,14 @@ def executar_experimento_hipotese_emoticons(
     rot_pos = "Positivo" if "Positivo" in classes_ord else classes_ord[-1]
     rot_neg = "Negativo" if "Negativo" in classes_ord else classes_ord[0]
 
-    pred_leia_com = [rot_pos if sia.polarity_scores(str(t))["compound"] >= 0 else rot_neg for t in df_teste["tweet_text"]]
-    pred_leia_sem = [rot_pos if sia.polarity_scores(RE_EMOTICONS_LEAKAGE.sub("", str(t)))["compound"] >= 0 else rot_neg for t in df_teste["tweet_text"]]
+    pred_leia_com = [
+        rot_pos if sia.polarity_scores(limpar_texto_para_leia(t, remover_emoticons=False))["compound"] >= 0 else rot_neg
+        for t in df_teste["tweet_text"]
+    ]
+    pred_leia_sem = [
+        rot_pos if sia.polarity_scores(limpar_texto_para_leia(t, remover_emoticons=True))["compound"] >= 0 else rot_neg
+        for t in df_teste["tweet_text"]
+    ]
 
     linhas.append({"Modelo": "LeIA (Léxico)", "Cenário": "1. Treino COM -> Teste COM", "Acurácia": accuracy_score(y_te, pred_leia_com), "F1_Macro": f1_score(y_te, pred_leia_com, average="macro")})
     linhas.append({"Modelo": "LeIA (Léxico)", "Cenário": "2. Treino SEM -> Teste SEM", "Acurácia": accuracy_score(y_te, pred_leia_sem), "F1_Macro": f1_score(y_te, pred_leia_sem, average="macro")})
@@ -1073,7 +1295,7 @@ def executar_experimento_hipotese_emoticons(
     print("\n=== F1-MACRO (%) POR CENÁRIO ===")
     print(tabela_pivot.round(2).to_string())
 
-    # Gráfico individual bem espaçado
+    # Gráfico individual bem espaçado (sem rótulos 'nan%' para o LeIA no cenário 3)
     fig, ax = plt.subplots(figsize=(11.5, 5.6))
     cores_cenarios = ["#C44E52", "#1B9E77", "#DD8452"]
     tabela_pivot.plot(kind="bar", ax=ax, width=0.72, color=cores_cenarios, edgecolor="#222222", linewidth=0.7)
@@ -1087,14 +1309,18 @@ def executar_experimento_hipotese_emoticons(
     _estilizar_eixo(ax, grade_eixo="y")
 
     for container in ax.containers:
-        ax.bar_label(container, fmt="%.1f%%", padding=4, fontsize=8.8, fontweight="bold")
+        rotulos = [f"{v:.1f}%" if np.isfinite(v) else "" for v in container.datavalues]
+        ax.bar_label(container, labels=rotulos, padding=4, fontsize=8.8, fontweight="bold")
 
     _exibir_e_salvar(fig, "10_hipotese_emoticons_leakage_vs_generalizacao.png", pasta_saida)
 
-    # Evidência dos pesos na Regressão Logística
+    # Evidência dos pesos na Regressão Logística (guarda para problemas binários)
     def _mostrar_top_pesos(pipe, titulo, n=8):
         vec = pipe.named_steps["vec"]
         clf = pipe.named_steps["clf"]
+        if len(clf.classes_) != 2:
+            print(f"\n=== {titulo} (exibição de pesos simplificada apenas para classificação binária) ===")
+            return
         termos = np.array(vec.get_feature_names_out())
         pesos = clf.coef_[0]
         top_neg = list(zip(termos[np.argsort(pesos)[:n]], np.sort(pesos)[:n].round(2)))
@@ -1187,7 +1413,11 @@ def main():
     inicio_total = time.perf_counter()
 
     print("=== 1. CARREGANDO RECURSOS NLP E CORPUS ===")
-    nlp_model = carregar_spacy(SPACY_MODELS["SMALL"], emoticons_especiais=EMOTICONS)
+    nlp_model = carregar_spacy(
+        SPACY_MODELS["SMALL"],
+        emoticons_especiais=EMOTICONS,
+        usar_lema=USAR_LEMA,
+    )
     stopwords_pt = carregar_stopwords_pt()
     dataset_tweets = carregar_corpus()
     print(f"Corpus original carregado: {len(dataset_tweets):,} registros".replace(",", "."))
@@ -1199,8 +1429,11 @@ def main():
         nlp_model=nlp_model,
         limite=LIMITE_AMOSTRA,
         usar_lema=USAR_LEMA,
+        remover_emoticons=REMOVER_EMOTICONS_PRINCIPAL,
+        normalizar_alongamentos=NORMALIZAR_ALONGAMENTOS,
         n_process=N_PROCESS_SPACY,
         random_state=RANDOM_STATE,
+        usar_cache=USAR_CACHE_PREPROCESSAMENTO,
     )
 
     print("\n=== 3. ANÁLISE EXPLORATÓRIA (EDA) ===")
@@ -1208,7 +1441,7 @@ def main():
 
     print("\n=== 4. SPLIT COMPARTILHADO E SUITE DE BENCHMARKS ===")
     df_treino, df_teste = criar_split_compartilhado(dataset_limpo, test_size=TEST_SIZE, random_state=RANDOM_STATE)
-    print(f"Total único: {len(df_treino) + len(df_teste)} | Treino: {len(df_treino)} | Teste: {len(df_teste)}")
+    print(f"Total único: {len(df_treino) + len(df_teste):,} | Treino: {len(df_treino):,} | Teste: {len(df_teste):,}".replace(",", "."))
 
     df_bench, detalhes, classes_nomes = executar_suite_benchmarks(
         df_treino=df_treino,
@@ -1217,6 +1450,8 @@ def main():
         stopwords_set=stopwords_pt,
         nlp_model=nlp_model,
         usar_lema=USAR_LEMA,
+        remover_emoticons=REMOVER_EMOTICONS_PRINCIPAL,
+        normalizar_alongamentos=NORMALIZAR_ALONGAMENTOS,
         pasta_modelos=PASTA_MODELOS,
         n_amostras_runtime=100,
         incluir_leia=True,
@@ -1248,7 +1483,7 @@ def main():
     print("\n=== 5. GERANDO GRÁFICOS DESACOPLADOS E ANÁLISE DE ERROS ===")
     plotar_relatorio_benchmarks(df_bench, detalhes, classes_nomes, top_n_matrizes=4, pasta_saida=PASTA_GRAFICOS)
 
-    erros_top = inspecionar_erros(df_teste, detalhes, melhor_nome, n=10)
+    erros_top = inspecionar_erros(df_teste, detalhes, melhor_nome, n=10, pasta_saida=PASTA_GRAFICOS)
     print(erros_top.to_string(index=False))
 
     print("\n=== TESTE DE INFERÊNCIA CARREGANDO O MELHOR .PKL ===")
